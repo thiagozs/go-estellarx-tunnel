@@ -307,6 +307,10 @@ Internet → [Server :443] → WebSocket → [Client] → localhost:PORT
               ↑ autenticacao por token
 ```
 
-## Licenca
+## Licença
 
-MIT
+Este projeto é distribuído sob a Licença MIT. Consulte o arquivo [LICENSE](LICENSE) para obter detalhes.
+
+## Autor
+
+2026, Thiago Zilli Sarmento :heart:

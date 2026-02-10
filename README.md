@@ -309,4 +309,8 @@ Internet → [Server :443] → WebSocket → [Client] → localhost:PORT
 
 ## License
 
-MIT
+This project is distributed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+## Autor
+
+2026, Thiago Zilli Sarmento :heart:
