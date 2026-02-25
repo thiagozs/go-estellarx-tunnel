@@ -1,7 +1,13 @@
 MODULE   := github.com/thiagozs/go-estellarx-tunnel
 BIN_DIR  := bin
 
-.PHONY: all build server client clean fmt vet tidy cross-linux
+# Certificate management defaults (override on CLI: make run-server-tls CERT_TTL=48h)
+CERT_CACHE_DIR        ?= certs
+CERT_TTL              ?= 168h
+CERT_CLEANUP_INTERVAL ?= 6h
+
+.PHONY: all build server client clean fmt vet tidy cross-linux \
+        run-server run-server-tls run-client
 
 all: build
 
@@ -29,8 +35,21 @@ vet:
 tidy:
 	go mod tidy
 
+# Run server locally without TLS (development)
 run-server:
 	go run ./server serve -p 8080 -d localhost
+
+# Run server with TLS + certificate management (production-like)
+# Requires: TLS_DOMAIN and TOKEN env vars (or override on CLI)
+#   make run-server-tls TLS_DOMAIN=tunnel.example.com TOKEN=mysecret
+run-server-tls:
+	go run ./server serve \
+	  -d $(TLS_DOMAIN) \
+	  -t "$(TOKEN)" \
+	  --tls-domain $(TLS_DOMAIN) \
+	  --cert-cache-dir $(CERT_CACHE_DIR) \
+	  --cert-ttl $(CERT_TTL) \
+	  --cert-cleanup-interval $(CERT_CLEANUP_INTERVAL)
 
 run-client:
 	go run ./client expose 3000 -s ws://localhost:8080/_tunnel/ws -d myapp

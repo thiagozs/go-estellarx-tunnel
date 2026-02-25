@@ -60,10 +60,13 @@ var upgrader = websocket.Upgrader{
 
 func main() {
 	var (
-		port      int
-		domain    string
-		token     string
-		tlsDomain string
+		port                int
+		domain              string
+		token               string
+		tlsDomain           string
+		certCacheDir        string
+		certTTL             time.Duration
+		certCleanupInterval time.Duration
 	)
 
 	rootCmd := &cobra.Command{
@@ -75,7 +78,7 @@ func main() {
 		Use:   "serve",
 		Short: "Start the tunnel server",
 		Run: func(cmd *cobra.Command, args []string) {
-			runServer(port, domain, token, tlsDomain)
+			runServer(port, domain, token, tlsDomain, certCacheDir, certTTL, certCleanupInterval)
 		},
 	}
 
@@ -83,6 +86,9 @@ func main() {
 	serveCmd.Flags().StringVarP(&domain, "domain", "d", "localhost", "Base domain for subdomains (e.g. tunnel.example.com)")
 	serveCmd.Flags().StringVarP(&token, "token", "t", "", "Auth token clients must provide (empty = no auth)")
 	serveCmd.Flags().StringVar(&tlsDomain, "tls-domain", "", "Enable TLS via Let's Encrypt for this domain")
+	serveCmd.Flags().StringVar(&certCacheDir, "cert-cache-dir", "certs", "Directory for TLS certificate cache")
+	serveCmd.Flags().DurationVar(&certTTL, "cert-ttl", 7*24*time.Hour, "Remove cert cache entries for subdomains inactive longer than this duration")
+	serveCmd.Flags().DurationVar(&certCleanupInterval, "cert-cleanup-interval", 6*time.Hour, "How often to run the cert cache cleanup")
 
 	rootCmd.AddCommand(serveCmd)
 
@@ -91,14 +97,20 @@ func main() {
 	}
 }
 
-func runServer(port int, domain, token, tlsDomain string) {
+func runServer(port int, domain, token, tlsDomain, certCacheDir string, certTTL, certCleanupInterval time.Duration) {
 	reg := newRegistry()
+
+	var cm *certManager
+	if tlsDomain != "" {
+		cm = newCertManager(certCacheDir, tlsDomain, certTTL)
+		cm.runCleanup(certCleanupInterval)
+	}
 
 	mux := http.NewServeMux()
 
 	// WebSocket control endpoint — clients connect here to register tunnels.
 	mux.HandleFunc("/_tunnel/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleControl(w, r, reg, token)
+		handleControl(w, r, reg, token, cm)
 	})
 
 	// Everything else is proxied to the matching tunnel client.
@@ -110,11 +122,22 @@ func runServer(port int, domain, token, tlsDomain string) {
 
 	if tlsDomain != "" {
 		m := &autocert.Manager{
-			Cache:  autocert.DirCache("certs"),
+			Cache:  autocert.DirCache(certCacheDir),
 			Prompt: autocert.AcceptTOS,
 			HostPolicy: func(_ context.Context, host string) error {
-				if host == tlsDomain || strings.HasSuffix(host, "."+tlsDomain) {
+				// Always allow the base domain itself.
+				if host == tlsDomain {
 					return nil
+				}
+				// For subdomains, only issue/renew a certificate if there is
+				// an active tunnel registered. This prevents certificate issuance
+				// for dead or non-existent subdomains (e.g. scanners, bots, stale clients),
+				// conserving the Let's Encrypt rate limit (50 certs / 7 days).
+				if sub, ok := strings.CutSuffix(host, "."+tlsDomain); ok {
+					if reg.get(sub) != nil {
+						return nil
+					}
+					return fmt.Errorf("acme/autocert: no active tunnel for %q", host)
 				}
 				return fmt.Errorf("acme/autocert: host %q not allowed", host)
 			},
@@ -140,7 +163,7 @@ func runServer(port int, domain, token, tlsDomain string) {
 
 // handleControl upgrades to WebSocket and manages the tunnel lifecycle.
 func handleControl(w http.ResponseWriter, r *http.Request,
-	reg *registry, authToken string) {
+	reg *registry, authToken string, cm *certManager) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
@@ -179,7 +202,16 @@ func handleControl(w http.ResponseWriter, r *http.Request,
 		pending:   make(map[string]chan *shared.Message),
 	}
 	reg.register(sub, t)
-	defer reg.unregister(sub)
+	if cm != nil {
+		cm.touch(sub)
+	}
+	defer func() {
+		reg.unregister(sub)
+		if cm != nil {
+			cm.touch(sub) // update last-seen on disconnect so TTL is from last activity
+			cm.save()
+		}
+	}()
 
 	// Send ack.
 	ack := &shared.Message{Type: shared.MsgTypeRegisterAck, Subdomain: sub}

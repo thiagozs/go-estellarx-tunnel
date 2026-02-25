@@ -11,6 +11,8 @@ Expose local HTTP services to the internet through a WebSocket-based tunnel.
 - **Subdomain routing** — each tunnel gets a unique subdomain (`myapp.tunnel.example.com`)
 - **Token auth** — optional shared-secret authentication
 - **TLS with Let's Encrypt** — automatic certificates via `autocert`
+- **Certificate rate-limit guard** — certificates are only issued for subdomains with an active tunnel; scanners and bots cannot consume quota
+- **Certificate cache cleanup** — inactive subdomain certs are removed from the local cache on a configurable schedule, preventing indefinite accumulation
 - **Auto-reconnect** — exponential backoff on the client side
 - **CLI** — powered by `cobra` (`tunnel expose 8080`)
 
@@ -159,7 +161,10 @@ WorkingDirectory=/opt/tunnel
 ExecStart=/opt/tunnel/bin/tunnel-server serve \
   -d tunnel.estellarx.com \
   -t "PASTE_YOUR_TOKEN_HERE" \
-  --tls-domain tunnel.estellarx.com
+  --tls-domain tunnel.estellarx.com \
+  --cert-cache-dir /opt/tunnel/certs \
+  --cert-ttl 168h \
+  --cert-cleanup-interval 6h
 Restart=always
 RestartSec=5
 
@@ -270,25 +275,37 @@ Access:
 
 ### Troubleshooting
 
-| Problem               | Solution                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------- |
-| `connection refused`  | Check that ports 80/443 are open (`ufw status`)                                       |
-| `certificate error`   | Wait 1-2 min for Let's Encrypt to issue. Check logs: `journalctl -u tunnel-server -f` |
-| `invalid token`       | Client token must match the server token exactly                                      |
-| `no tunnel subdomain` | DNS `*.tunnel.yourdomain` must point to the VPS                                       |
-| `tunnel not found`    | The client must be connected with that subdomain                                      |
-| Client disconnects    | Auto-reconnect retries with exponential backoff (2s, 4s, 8s... max 30s)               |
+| Problem | Solution |
+| ------- | -------- |
+| `connection refused` | Check that ports 80/443 are open (`ufw status`) |
+| `certificate error` | Wait 1-2 min for Let's Encrypt to issue. Check logs: `journalctl -u tunnel-server -f` |
+| `invalid token` | Client token must match the server token exactly |
+| `no tunnel subdomain` | DNS `*.tunnel.yourdomain` must point to the VPS |
+| `tunnel not found` | The client must be connected with that subdomain |
+| `no active tunnel for "x.y.com"` | Expected — cert issuance is blocked when no client is connected (rate-limit guard) |
+| `too many certificates` (LE 429) | Let's Encrypt limit of 50 certs/7 days reached. Wait for the window to expire. Lower `--cert-ttl` to clean up stale cache entries sooner |
+| Client disconnects | Auto-reconnect retries with exponential backoff (2s, 4s, 8s… max 30s) |
 
 ## CLI flags
 
 ### Server (`tunnel-server serve`)
 
-| Flag           | Short | Default     | Description                       |
-| -------------- | ----- | ----------- | --------------------------------- |
-| `--port`       | `-p`  | `8080`      | HTTP listen port                  |
-| `--domain`     | `-d`  | `localhost` | Base domain for subdomain routing |
-| `--token`      | `-t`  | _(empty)_   | Auth token (empty = no auth)      |
-| `--tls-domain` |       | _(empty)_   | Enable Let's Encrypt TLS          |
+| Flag                       | Short | Default     | Description                                                        |
+| -------------------------- | ----- | ----------- | ------------------------------------------------------------------ |
+| `--port`                   | `-p`  | `8080`      | HTTP listen port                                                   |
+| `--domain`                 | `-d`  | `localhost` | Base domain for subdomain routing                                  |
+| `--token`                  | `-t`  | _(empty)_   | Auth token (empty = no auth)                                       |
+| `--tls-domain`             |       | _(empty)_   | Enable Let's Encrypt TLS for this domain                           |
+| `--cert-cache-dir`         |       | `certs`     | Directory for the TLS certificate cache                            |
+| `--cert-ttl`               |       | `168h`      | Remove cache entries for subdomains inactive longer than this      |
+| `--cert-cleanup-interval`  |       | `6h`        | How often the cert cache cleanup runs                              |
+
+> **Note on Let's Encrypt rate limits:** Let's Encrypt allows at most **50 certificates per registered domain per 7 days**. The server guards against this in two ways:
+>
+> 1. **HostPolicy guard** — certificates are only issued when a client tunnel is actively connected for that subdomain. Scanners and bots cannot consume quota.
+> 2. **Cache cleanup** — cert files for subdomains inactive longer than `--cert-ttl` are deleted on every `--cert-cleanup-interval` cycle, preventing indefinite accumulation.
+>
+> Revoking or deleting certificates does **not** reset the rate-limit counter; that counter resets on its own after 7 days.
 
 ### Client (`tunnel-client expose <port>`)
 
