@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -39,6 +40,12 @@ func newRegistry() *registry {
 func (r *registry) register(sub string, t *tunnel) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// If a tunnel is already registered for this subdomain, close it so the
+	// displaced client is notified and the connection is not left orphaned.
+	if existing, ok := r.tunnels[sub]; ok {
+		log.Printf("tunnel %s: displacing existing connection", sub)
+		_ = existing.conn.Close()
+	}
 	r.tunnels[sub] = t
 }
 
@@ -54,9 +61,14 @@ func (r *registry) get(sub string) *tunnel {
 	return r.tunnels[sub]
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
+var (
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	// reqCounter generates unique, collision-free request IDs under concurrent load.
+	reqCounter atomic.Uint64
+)
 
 func main() {
 	var (
@@ -216,8 +228,28 @@ func handleControl(w http.ResponseWriter, r *http.Request,
 	// Send ack.
 	ack := &shared.Message{Type: shared.MsgTypeRegisterAck, Subdomain: sub}
 	b, _ := ack.Encode()
-	conn.WriteMessage(websocket.TextMessage, b)
+	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+		log.Printf("tunnel %s: send ack failed: %v", sub, err)
+		return
+	}
 	log.Printf("tunnel registered: %s", sub)
+
+	// Keepalive: send a ping every 30 s so dead connections are detected
+	// proactively instead of waiting for the next request to time out.
+	go func() {
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for range tick.C {
+			ping, _ := (&shared.Message{Type: shared.MsgTypePing}).Encode()
+			t.mu.Lock()
+			err := t.conn.WriteMessage(websocket.TextMessage, ping)
+			t.mu.Unlock()
+			if err != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}()
 
 	// Read loop — receives responses from the client.
 	for {
@@ -249,18 +281,18 @@ func handleProxy(w http.ResponseWriter, r *http.Request,
 	reg *registry, baseDomain string) {
 	sub := extractSubdomain(r.Host, baseDomain)
 	if sub == "" {
-		http.Error(w, "no tunnel subdomain found", http.StatusBadGateway)
+		jsonError(w, "no subdomain provided", http.StatusBadGateway)
 		return
 	}
 
 	t := reg.get(sub)
 	if t == nil {
-		http.Error(w, fmt.Sprintf("tunnel %q not found", sub), http.StatusBadGateway)
+		jsonError(w, fmt.Sprintf("tunnel %q is not registered or offline", sub), http.StatusNotFound)
 		return
 	}
 
-	// Build a request ID.
-	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
+	// Build a request ID — atomic counter guarantees uniqueness under concurrent load.
+	reqID := fmt.Sprintf("%d", reqCounter.Add(1))
 
 	// Read body.
 	body, _ := io.ReadAll(r.Body)
@@ -311,7 +343,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request,
 			status = http.StatusOK
 		}
 		w.WriteHeader(status)
-		w.Write(resp.Data)
+		_, _ = w.Write(resp.Data)
 	case <-time.After(30 * time.Second):
 		http.Error(w, "tunnel timeout", http.StatusGatewayTimeout)
 	}
@@ -341,5 +373,12 @@ func extractSubdomain(host, baseDomain string) string {
 func sendError(conn *websocket.Conn, errMsg string) {
 	m := &shared.Message{Type: shared.MsgTypeError, Error: errMsg}
 	b, _ := m.Encode()
-	conn.WriteMessage(websocket.TextMessage, b)
+	_ = conn.WriteMessage(websocket.TextMessage, b)
+}
+
+// jsonError writes a JSON error response to the HTTP client.
+func jsonError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":%q}}`, code, message)
 }
