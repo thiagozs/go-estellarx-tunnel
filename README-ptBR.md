@@ -11,6 +11,8 @@ Exponha servicos HTTP locais para a internet atraves de um tunnel baseado em Web
 - **Roteamento por subdominio** — cada tunnel recebe um subdominio unico (`myapp.tunnel.example.com`)
 - **Autenticacao por token** — shared-secret opcional
 - **TLS com Let's Encrypt** — certificados automaticos via `autocert`
+- **TLS wildcard via DNS-01** — certificado unico `*.dominio` usando provedores DNS plugaveis (name.com, Cloudflare)
+- **Provedores DNS plugaveis** — implemente `DNSProvider` para suportar qualquer registrador
 - **Protecao contra rate limit** — certificados so sao emitidos para subdominios com tunnel ativo; scanners e bots nao consomem cota
 - **Limpeza do cache de certificados** — entradas inativas sao removidas em ciclos configuravéis, evitando acumulo indefinido
 - **Reconnect automatico** — backoff exponencial no client
@@ -63,7 +65,7 @@ Este guia cobre todo o processo: VPS, DNS, firewall, systemd e cliente.
 
 - Um **VPS** (Ubuntu/Debian) com IP publico (ex: `203.0.113.50`)
 - Um **dominio** registrado (ex: `estellarx.com`)
-- Acesso ao painel DNS do seu provedor (Cloudflare, Route53, GoDaddy, etc.)
+- Acesso ao painel DNS do seu provedor
 
 ### 2. Configurar DNS
 
@@ -84,28 +86,22 @@ Verifique a propagacao:
 ```bash
 dig +short tunnel.estellarx.com
 dig +short myapi.tunnel.estellarx.com
-
-# HTTPie (alternativa)
-http GET https://dns.google/resolve name==tunnel.estellarx.com type==A
 ```
 
 Ambos devem retornar `203.0.113.50`.
 
-> **Cloudflare**: desative o proxy (nuvem laranja → cinza) para que o TLS do Let's Encrypt funcione diretamente.
+> **Cloudflare proxy**: no modo wildcard DNS-01, desative a nuvem laranja (proxy) para que o Let's Encrypt valide diretamente. No modo HTTP-01 por subdominio o proxy tambem deve estar desativado.
 
 ### 3. Preparar a VPS
 
 ```bash
-# Conectar na VPS
 ssh root@203.0.113.50
 
-# Atualizar e instalar dependencias
 apt update && apt upgrade -y
 apt install -y make golang-go git ufw
 
-# Abrir portas necessarias
 ufw allow 22/tcp    # SSH
-ufw allow 80/tcp    # HTTP (challenge Let's Encrypt)
+ufw allow 80/tcp    # HTTP (challenge Let's Encrypt / redirect)
 ufw allow 443/tcp   # HTTPS (tunnel)
 ufw enable
 ufw status
@@ -114,18 +110,14 @@ ufw status
 ### 4. Build na VPS
 
 ```bash
-# Clonar o projeto
 git clone https://github.com/thiagozs/go-estellarx-tunnel.git /opt/tunnel
 cd /opt/tunnel
-
-# Compilar
 make build
 ```
 
 Ou compile localmente e envie o binario:
 
 ```bash
-# Na sua maquina (cross-compile para Linux)
 make cross-linux
 scp bin/tunnel-server-linux-amd64 root@203.0.113.50:/opt/tunnel/bin/tunnel-server
 ```
@@ -144,12 +136,25 @@ echo "TOKEN: $TOKEN"
 mkdir -p /opt/tunnel/certs
 ```
 
-O Let's Encrypt salva os certificados automaticamente nesta pasta via `autocert`.
-
 ### 7. Criar servico systemd
 
+Escolha o modo TLS de acordo com o seu provedor DNS.
+
+#### Opcao A — TLS wildcard via name.com (DNS-01)
+
+Um unico certificado `*.tunnel.estellarx.com` cobre todos os subdominios automaticamente.
+Sem emissao por subdominio, sem preocupacao com rate limit.
+
 ```bash
-cat > /etc/systemd/system/tunnel-server.service << 'EOF'
+cat > /opt/tunnel/.env << 'EOF'
+TUNNEL_TOKEN=COLE_SEU_TOKEN_AQUI
+NAMECOM_TOKEN=COLE_SEU_TOKEN_NAMECOM_AQUI
+EOF
+chmod 600 /opt/tunnel/.env
+```
+
+```ini
+# /etc/systemd/system/tunnel-server.service
 [Unit]
 Description=EstellarX Tunnel Server
 After=network.target
@@ -158,133 +163,157 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/tunnel
+EnvironmentFile=/opt/tunnel/.env
 ExecStart=/opt/tunnel/bin/tunnel-server serve \
   -d tunnel.estellarx.com \
-  -t "COLE_SEU_TOKEN_AQUI" \
+  -t "${TUNNEL_TOKEN}" \
   --tls-domain tunnel.estellarx.com \
   --cert-cache-dir /opt/tunnel/certs \
-  --cert-ttl 168h \
-  --cert-cleanup-interval 6h
+  --dns-namecom-user SEU_USUARIO_NAMECOM \
+  --dns-namecom-token "${NAMECOM_TOKEN}"
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
 ```
 
-> Substitua `COLE_SEU_TOKEN_AQUI` pelo token gerado no passo 5.
-> Substitua `tunnel.estellarx.com` pelo seu dominio.
+> Requer acesso a API habilitado no name.com: Conta → Configuracoes → API
+
+#### Opcao B — TLS wildcard via Cloudflare (DNS-01)
 
 ```bash
-# Ativar e iniciar
+cat > /opt/tunnel/.env << 'EOF'
+TUNNEL_TOKEN=COLE_SEU_TOKEN_AQUI
+CF_API_TOKEN=COLE_SEU_TOKEN_CLOUDFLARE_AQUI
+EOF
+chmod 600 /opt/tunnel/.env
+```
+
+```ini
+# /etc/systemd/system/tunnel-server.service
+[Unit]
+Description=EstellarX Tunnel Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tunnel
+EnvironmentFile=/opt/tunnel/.env
+ExecStart=/opt/tunnel/bin/tunnel-server serve \
+  -d tunnel.estellarx.com \
+  -t "${TUNNEL_TOKEN}" \
+  --tls-domain tunnel.estellarx.com \
+  --cert-cache-dir /opt/tunnel/certs \
+  --dns-cf-token "${CF_API_TOKEN}"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> Requer um API Token do Cloudflare com permissao **Zone / DNS / Edit**.
+> Crie em: Cloudflare Dashboard → Perfil → API Tokens
+
+#### Opcao C — TLS por subdominio via HTTP-01 (autocert)
+
+Emite um certificado por subdominio conectado. Sujeito ao rate limit do Let's Encrypt (50 certs / 7 dias).
+
+```ini
+ExecStart=/opt/tunnel/bin/tunnel-server serve \
+  -d tunnel.estellarx.com \
+  -t "SEU_TOKEN" \
+  --tls-domain tunnel.estellarx.com \
+  --cert-cache-dir /opt/tunnel/certs \
+  --cert-ttl 168h \
+  --cert-cleanup-interval 6h
+```
+
+```bash
 systemctl daemon-reload
 systemctl enable tunnel-server
 systemctl start tunnel-server
 
-# Verificar status
 systemctl status tunnel-server
-
-# Ver logs
 journalctl -u tunnel-server -f
 ```
 
-O servidor agora escuta em:
+O servidor escuta em:
 
-- `:80` → redirect HTTP para HTTPS + challenge ACME
+- `:80` → redirect HTTP para HTTPS + challenge ACME (modo HTTP-01)
 - `:443` → tunnel com TLS automatico
 
 ### 8. Verificar o servidor
 
 ```bash
-# curl
 curl -I https://tunnel.estellarx.com/
-
-# HTTPie
-http --headers GET https://tunnel.estellarx.com/
 ```
 
-Deve retornar `502 Bad Gateway` com "no tunnel subdomain found" — isso e correto, significa que o server esta rodando.
+Deve retornar `502 Bad Gateway` — correto, significa que o servidor esta rodando e aguardando clients.
 
-### 9. Conectar o client (na sua maquina local)
-
-Compile o client localmente:
+### 9. Conectar o client
 
 ```bash
-make client
-```
+make client   # compilar client localmente
 
-Suba a sua API local (exemplo: porta 3000):
-
-```bash
-go run ./cmd/api    # ou qualquer app local
-```
-
-Conecte o tunnel:
-
-```bash
 ./bin/tunnel-client expose 3000 \
   --server wss://tunnel.estellarx.com/_tunnel/ws \
-  --token "COLE_SEU_TOKEN_AQUI" \
+  --token "SEU_TOKEN" \
   --subdomain api
 ```
 
-### 10. Acessar a API de qualquer lugar
+### 10. Acessar o servico de qualquer lugar
 
 ```bash
-# curl
 curl https://api.tunnel.estellarx.com/
-curl -X POST https://api.tunnel.estellarx.com/users \
-  -H "Content-Type: application/json" \
-  -d '{"name": "teste"}'
-
-# HTTPie
-http GET https://api.tunnel.estellarx.com/
-http POST https://api.tunnel.estellarx.com/users name=teste
 ```
 
 ### 11. Multiplos tunnels
 
-Voce pode expor varios servicos simultaneamente com subdominios diferentes:
-
 ```bash
-# Terminal 1 — API backend na porta 3000
+# Terminal 1 — API na porta 3000
 ./bin/tunnel-client expose 3000 \
   --server wss://tunnel.estellarx.com/_tunnel/ws \
-  --token "SEU_TOKEN" \
-  --subdomain api
+  --token "SEU_TOKEN" --subdomain api
 
 # Terminal 2 — Frontend na porta 5173
 ./bin/tunnel-client expose 5173 \
   --server wss://tunnel.estellarx.com/_tunnel/ws \
-  --token "SEU_TOKEN" \
-  --subdomain app
+  --token "SEU_TOKEN" --subdomain app
 
 # Terminal 3 — Admin na porta 8081
 ./bin/tunnel-client expose 8081 \
   --server wss://tunnel.estellarx.com/_tunnel/ws \
-  --token "SEU_TOKEN" \
-  --subdomain admin
+  --token "SEU_TOKEN" --subdomain admin
 ```
-
-Acesso:
 
 - `https://api.tunnel.estellarx.com` → localhost:3000
 - `https://app.tunnel.estellarx.com` → localhost:5173
 - `https://admin.tunnel.estellarx.com` → localhost:8081
 
-### Troubleshooting
+## Provedores DNS
 
-| Problema | Solucao |
-| -------- | ------- |
-| `connection refused` | Verifique se as portas 80/443 estao abertas (`ufw status`) |
-| `certificate error` | Aguarde 1-2 min para o Let's Encrypt emitir. Logs: `journalctl -u tunnel-server -f` |
-| `invalid token` | Token do client deve ser identico ao do server |
-| `no tunnel subdomain` | O DNS `*.tunnel.seudominio` deve apontar para a VPS |
-| `tunnel not found` | O client precisa estar conectado com aquele subdomain |
-| `no active tunnel for "x.y.com"` | Esperado — emissao de cert bloqueada quando nenhum client esta conectado (protecao de rate limit) |
-| `too many certificates` (LE 429) | Limite do Let's Encrypt de 50 certs/7 dias atingido. Aguarde a janela expirar. Reduza `--cert-ttl` para limpar entradas inativas mais cedo |
-| Client desconecta | Reconnect automatico com backoff exponencial (2s, 4s, 8s... max 30s) |
+O modo wildcard DNS-01 e suportado por uma interface `DNSProvider` plugavel. Provedores inclusos:
+
+| Provedor   | Flag                                         | Documentacao                                     |
+| ---------- | -------------------------------------------- | ------------------------------------------------ |
+| name.com   | `--dns-namecom-user` + `--dns-namecom-token` | name.com/account/settings/api                    |
+| Cloudflare | `--dns-cf-token`                             | Cloudflare Dashboard → Perfil → API Tokens       |
+
+### Adicionando um provedor customizado
+
+Implemente dois metodos e passe o provider ao servidor:
+
+```go
+type DNSProvider interface {
+    SetTXTRecord(ctx context.Context, domain, value string) (recordID string, err error)
+    DeleteTXTRecord(ctx context.Context, domain, recordID string) error
+}
+```
+
+Veja [providers/namecom/](providers/namecom/) e [providers/cloudflare/](providers/cloudflare/) como referencia, e [examples/](examples/) para exemplos executaveis.
 
 ## Flags da CLI
 
@@ -292,20 +321,19 @@ Acesso:
 
 | Flag                      | Short | Default     | Descricao                                                         |
 | ------------------------- | ----- | ----------- | ----------------------------------------------------------------- |
-| `--port`                  | `-p`  | `8080`      | Porta HTTP                                                        |
+| `--port`                  | `-p`  | `8080`      | Porta HTTP (apenas modo plain HTTP)                               |
 | `--domain`                | `-d`  | `localhost` | Dominio base para roteamento por subdominio                       |
 | `--token`                 | `-t`  | _(vazio)_   | Token de autenticacao (vazio = sem auth)                          |
 | `--tls-domain`            |       | _(vazio)_   | Ativar TLS via Let's Encrypt para este dominio                    |
 | `--cert-cache-dir`        |       | `certs`     | Diretorio do cache de certificados TLS                            |
-| `--cert-ttl`              |       | `168h`      | Remove entradas do cache para subdominios inativos ha mais tempo  |
-| `--cert-cleanup-interval` |       | `6h`        | Frequencia de execucao da limpeza do cache de certificados        |
+| `--cert-ttl`              |       | `168h`      | Remove entradas de subdominios inativos (apenas HTTP-01)          |
+| `--cert-cleanup-interval` |       | `6h`        | Frequencia da limpeza do cache de certificados (apenas HTTP-01)   |
+| `--dns-namecom-user`      |       | _(vazio)_   | Usuario da API name.com — ativa TLS wildcard DNS-01               |
+| `--dns-namecom-token`     |       | _(vazio)_   | Token da API name.com                                             |
+| `--dns-cf-token`          |       | _(vazio)_   | Token da API Cloudflare — ativa TLS wildcard DNS-01               |
 
-> **Nota sobre rate limits do Let's Encrypt:** O Let's Encrypt permite no maximo **50 certificados por dominio registrado a cada 7 dias**. O servidor protege contra isso de duas formas:
->
-> 1. **Guarda da HostPolicy** — certificados so sao emitidos quando ha um tunnel de client ativo para aquele subdominio. Scanners e bots nao consomem cota.
-> 2. **Limpeza do cache** — arquivos de cert para subdominios inativos ha mais que `--cert-ttl` sao removidos a cada ciclo de `--cert-cleanup-interval`, evitando acumulo indefinido.
->
-> Revogar ou deletar certificados **nao** reseta o contador de rate limit; ele expira sozinho apos 7 dias.
+> **Selecao do modo TLS:** se uma flag de provedor DNS for definida junto com `--tls-domain`, o modo wildcard DNS-01 e usado. Se apenas `--tls-domain` for definido, o modo HTTP-01 por subdominio (autocert) e usado. Sem `--tls-domain`, o servidor roda em HTTP simples.
+> **Rate limits do Let's Encrypt (modo HTTP-01):** maximo de 50 certificados por dominio registrado a cada 7 dias. O guarda da HostPolicy impede que scanners consumam cota. Use `--cert-ttl` e `--cert-cleanup-interval` para controlar o crescimento do cache. O modo wildcard DNS-01 emite um unico certificado e nao esta sujeito a limites por subdominio.
 
 ### Client (`tunnel-client expose <port>`)
 
@@ -317,16 +345,43 @@ Acesso:
 
 ## Arquitetura
 
-```
+```text
 Internet → [Server :443] → WebSocket → [Client] → localhost:PORT
               ↑ roteamento por subdominio
-              ↑ TLS (autocert)
+              ↑ TLS — wildcard DNS-01 (name.com / Cloudflare)
+              ↑      ou HTTP-01 por subdominio (autocert)
               ↑ autenticacao por token
 ```
 
-## Licença
+```text
+providers/
+  dns.go              ← interface DNSProvider
+  namecom/            ← implementacao name.com
+  cloudflare/         ← implementacao Cloudflare
 
-Este projeto é distribuído sob a Licença MIT. Consulte o arquivo [LICENSE](LICENSE) para obter detalhes.
+examples/
+  dns-namecom/        ← smoke-test de credenciais name.com
+  dns-cloudflare/     ← smoke-test de credenciais Cloudflare
+```
+
+## Troubleshooting
+
+| Problema | Solucao |
+| -------- | ------- |
+| `connection refused` | Verifique se as portas 80/443 estao abertas (`ufw status`) |
+| `certificate error` | Aguarde 1-2 min para o Let's Encrypt emitir. Logs: `journalctl -u tunnel-server -f` |
+| `invalid token` | Token do client deve ser identico ao do server |
+| `no tunnel subdomain` | O DNS `*.tunnel.seudominio` deve apontar para a VPS |
+| `tunnel not found` | O client precisa estar conectado com aquele subdominio |
+| `no active tunnel for "x.y.com"` | Esperado — emissao de cert bloqueada quando nenhum client esta conectado (protecao de rate limit) |
+| `too many certificates` (LE 429) | Limite atingido. Mude para modo wildcard DNS-01 para evitar limites por subdominio |
+| `Permission Denied` (DNS-01) | Credenciais invalidas ou acesso a API nao habilitado no provedor DNS |
+| Client desconecta | Reconnect automatico com backoff exponencial (2s, 4s, 8s... max 30s) |
+| Erros de TLS handshake nos logs | Normalmente scanners de internet sondando a porta — inofensivo, conexoes sao rejeitadas na camada TLS |
+
+## Licenca
+
+Este projeto e distribuido sob a Licenca MIT. Consulte o arquivo [LICENSE](LICENSE) para obter detalhes.
 
 ## Autor
 

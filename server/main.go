@@ -15,6 +15,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
+	"github.com/thiagozs/go-estellarx-tunnel/providers"
+	"github.com/thiagozs/go-estellarx-tunnel/providers/cloudflare"
+	"github.com/thiagozs/go-estellarx-tunnel/providers/namecom"
 	"github.com/thiagozs/go-estellarx-tunnel/shared"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -79,6 +82,9 @@ func main() {
 		certCacheDir        string
 		certTTL             time.Duration
 		certCleanupInterval time.Duration
+		namecomUser         string
+		namecomToken        string
+		cfToken             string
 	)
 
 	rootCmd := &cobra.Command{
@@ -90,7 +96,12 @@ func main() {
 		Use:   "serve",
 		Short: "Start the tunnel server",
 		Run: func(cmd *cobra.Command, args []string) {
-			runServer(port, domain, token, tlsDomain, certCacheDir, certTTL, certCleanupInterval)
+			dns, err := buildDNSProvider(namecomUser, namecomToken, cfToken)
+			if err != nil {
+				log.Fatal(err)
+			}
+			runServer(port, domain, token, tlsDomain, certCacheDir,
+				certTTL, certCleanupInterval, dns)
 		},
 	}
 
@@ -99,8 +110,13 @@ func main() {
 	serveCmd.Flags().StringVarP(&token, "token", "t", "", "Auth token clients must provide (empty = no auth)")
 	serveCmd.Flags().StringVar(&tlsDomain, "tls-domain", "", "Enable TLS via Let's Encrypt for this domain")
 	serveCmd.Flags().StringVar(&certCacheDir, "cert-cache-dir", "certs", "Directory for TLS certificate cache")
-	serveCmd.Flags().DurationVar(&certTTL, "cert-ttl", 7*24*time.Hour, "Remove cert cache entries for subdomains inactive longer than this duration")
-	serveCmd.Flags().DurationVar(&certCleanupInterval, "cert-cleanup-interval", 6*time.Hour, "How often to run the cert cache cleanup")
+	serveCmd.Flags().DurationVar(&certTTL, "cert-ttl", 7*24*time.Hour, "Remove cert cache entries for subdomains inactive longer than this duration (autocert mode only)")
+	serveCmd.Flags().DurationVar(&certCleanupInterval, "cert-cleanup-interval", 6*time.Hour, "How often to run the cert cache cleanup (autocert mode only)")
+	// name.com DNS-01
+	serveCmd.Flags().StringVar(&namecomUser, "dns-namecom-user", "", "name.com API username (enables wildcard DNS-01 TLS)")
+	serveCmd.Flags().StringVar(&namecomToken, "dns-namecom-token", "", "name.com API token (enables wildcard DNS-01 TLS)")
+	// Cloudflare DNS-01
+	serveCmd.Flags().StringVar(&cfToken, "dns-cf-token", "", "Cloudflare API token with Zone/DNS/Edit permission (enables wildcard DNS-01 TLS)")
 
 	rootCmd.AddCommand(serveCmd)
 
@@ -109,20 +125,32 @@ func main() {
 	}
 }
 
-func runServer(port int, domain, token, tlsDomain, certCacheDir string, certTTL, certCleanupInterval time.Duration) {
-	reg := newRegistry()
-
-	var cm *certManager
-	if tlsDomain != "" {
-		cm = newCertManager(certCacheDir, tlsDomain, certTTL)
-		cm.runCleanup(certCleanupInterval)
+// buildDNSProvider returns the appropriate DNSProvider based on which flags
+// were supplied. Returns nil (no error) when no wildcard DNS flags are set,
+// which signals the caller to fall back to per-subdomain HTTP-01 or plain HTTP.
+func buildDNSProvider(namecomUser, namecomToken, cfToken string) (providers.DNSProvider, error) {
+	switch {
+	case cfToken != "":
+		return cloudflare.New(cfToken), nil
+	case namecomUser != "" && namecomToken != "":
+		return namecom.New(namecomUser, namecomToken), nil
+	case namecomUser != "" || namecomToken != "":
+		return nil, fmt.Errorf("both --dns-namecom-user and --dns-namecom-token are required")
+	default:
+		return nil, nil // no wildcard DNS provider; use autocert or plain HTTP
 	}
+}
+
+func runServer(port int, domain, token, tlsDomain, certCacheDir string,
+	certTTL, certCleanupInterval time.Duration, dns providers.DNSProvider) {
+
+	reg := newRegistry()
 
 	mux := http.NewServeMux()
 
 	// WebSocket control endpoint — clients connect here to register tunnels.
 	mux.HandleFunc("/_tunnel/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleControl(w, r, reg, token, cm)
+		handleControl(w, r, reg, token)
 	})
 
 	// Everything else is proxied to the matching tunnel client.
@@ -132,19 +160,39 @@ func runServer(port int, domain, token, tlsDomain, certCacheDir string, certTTL,
 
 	addr := fmt.Sprintf(":%d", port)
 
-	if tlsDomain != "" {
+	switch {
+	// ── Wildcard mode: DNS-01 via pluggable provider ─────────────────────────
+	case tlsDomain != "" && dns != nil:
+		wcm := newWildcardCertManager(tlsDomain, certCacheDir, dns)
+		if err := wcm.Start(context.Background()); err != nil {
+			log.Fatalf("wildcard cert: %v", err)
+		}
+		srv := &http.Server{
+			Addr:      ":443",
+			Handler:   mux,
+			TLSConfig: wcm.TLSConfig(),
+		}
+		go func() {
+			log.Printf("HTTP redirect on :80")
+			log.Fatal(http.ListenAndServe(":80", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusMovedPermanently)
+			})))
+		}()
+		log.Printf("Tunnel server (TLS wildcard) on :443 domain=*.%s", tlsDomain)
+		log.Fatal(srv.ListenAndServeTLS("", ""))
+
+	// ── Per-subdomain mode: HTTP-01 via autocert ─────────────────────────────
+	case tlsDomain != "":
+		cm := newCertManager(certCacheDir, tlsDomain, certTTL)
+		cm.runCleanup(certCleanupInterval)
+
 		m := &autocert.Manager{
 			Cache:  autocert.DirCache(certCacheDir),
 			Prompt: autocert.AcceptTOS,
 			HostPolicy: func(_ context.Context, host string) error {
-				// Always allow the base domain itself.
 				if host == tlsDomain {
 					return nil
 				}
-				// For subdomains, only issue/renew a certificate if there is
-				// an active tunnel registered. This prevents certificate issuance
-				// for dead or non-existent subdomains (e.g. scanners, bots, stale clients),
-				// conserving the Let's Encrypt rate limit (50 certs / 7 days).
 				if sub, ok := strings.CutSuffix(host, "."+tlsDomain); ok {
 					if reg.get(sub) != nil {
 						return nil
@@ -160,14 +208,15 @@ func runServer(port int, domain, token, tlsDomain, certCacheDir string, certTTL,
 			TLSConfig: m.TLSConfig(),
 		}
 		srv.TLSConfig.NextProtos = append([]string{"h2", "http/1.1"}, srv.TLSConfig.NextProtos...)
-		// Redirect HTTP → HTTPS
 		go func() {
 			log.Printf("HTTP redirect on :80")
 			log.Fatal(http.ListenAndServe(":80", m.HTTPHandler(nil)))
 		}()
-		log.Printf("Tunnel server (TLS) on :443 domain=%s", tlsDomain)
+		log.Printf("Tunnel server (TLS per-subdomain) on :443 domain=%s", tlsDomain)
 		log.Fatal(srv.ListenAndServeTLS("", ""))
-	} else {
+
+	// ── Plain HTTP ───────────────────────────────────────────────────────────
+	default:
 		log.Printf("Tunnel server on %s domain=%s", addr, domain)
 		log.Fatal(http.ListenAndServe(addr, mux))
 	}
@@ -175,7 +224,7 @@ func runServer(port int, domain, token, tlsDomain, certCacheDir string, certTTL,
 
 // handleControl upgrades to WebSocket and manages the tunnel lifecycle.
 func handleControl(w http.ResponseWriter, r *http.Request,
-	reg *registry, authToken string, cm *certManager) {
+	reg *registry, authToken string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
@@ -214,16 +263,7 @@ func handleControl(w http.ResponseWriter, r *http.Request,
 		pending:   make(map[string]chan *shared.Message),
 	}
 	reg.register(sub, t)
-	if cm != nil {
-		cm.touch(sub)
-	}
-	defer func() {
-		reg.unregister(sub)
-		if cm != nil {
-			cm.touch(sub) // update last-seen on disconnect so TTL is from last activity
-			cm.save()
-		}
-	}()
+	defer reg.unregister(sub)
 
 	// Send ack.
 	ack := &shared.Message{Type: shared.MsgTypeRegisterAck, Subdomain: sub}
@@ -380,5 +420,6 @@ func sendError(conn *websocket.Conn, errMsg string) {
 func jsonError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	message = strings.ReplaceAll(message, "\"", "'")
 	_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":%q}}`, code, message)
 }

@@ -6,8 +6,18 @@ CERT_CACHE_DIR        ?= certs
 CERT_TTL              ?= 168h
 CERT_CLEANUP_INTERVAL ?= 6h
 
+# DNS provider credentials (override on CLI or export as env vars before running)
+#   make run-server-namecom TLS_DOMAIN=tunnel.example.com TOKEN=secret \
+#                           NAMECOM_USER=myuser NAMECOM_TOKEN=mytoken
+#   make run-server-cloudflare TLS_DOMAIN=tunnel.example.com TOKEN=secret \
+#                              CF_API_TOKEN=cf_token_here
+NAMECOM_USER  ?=
+NAMECOM_TOKEN ?=
+CF_API_TOKEN  ?=
+
 .PHONY: all build server client clean fmt vet tidy cross-linux \
-        run-server run-server-tls run-client
+        run-server run-server-tls run-server-namecom run-server-cloudflare run-client \
+        example-namecom example-cloudflare
 
 all: build
 
@@ -53,3 +63,34 @@ run-server-tls:
 
 run-client:
 	go run ./client expose 3000 -s ws://localhost:8080/_tunnel/ws -d myapp
+
+# Run server with wildcard TLS via name.com DNS-01
+# Requires: TLS_DOMAIN, TOKEN, NAMECOM_USER, NAMECOM_TOKEN
+run-server-namecom:
+	go run ./server serve \
+	  -d $(TLS_DOMAIN) \
+	  -t "$(TOKEN)" \
+	  --tls-domain $(TLS_DOMAIN) \
+	  --cert-cache-dir $(CERT_CACHE_DIR) \
+	  --dns-namecom-user $(NAMECOM_USER) \
+	  --dns-namecom-token $(NAMECOM_TOKEN)
+
+# Run server with wildcard TLS via Cloudflare DNS-01
+# Requires: TLS_DOMAIN, TOKEN, CF_API_TOKEN
+run-server-cloudflare:
+	go run ./server serve \
+	  -d $(TLS_DOMAIN) \
+	  -t "$(TOKEN)" \
+	  --tls-domain $(TLS_DOMAIN) \
+	  --cert-cache-dir $(CERT_CACHE_DIR) \
+	  --dns-cf-token $(CF_API_TOKEN)
+
+# Smoke-test DNS credentials (creates and deletes a test TXT record)
+# Requires: NAMECOM_USER, NAMECOM_TOKEN
+example-namecom:
+	NAMECOM_USER=$(NAMECOM_USER) NAMECOM_TOKEN=$(NAMECOM_TOKEN) \
+	  go run ./examples/dns-namecom
+
+# Requires: CF_API_TOKEN
+example-cloudflare:
+	CF_API_TOKEN=$(CF_API_TOKEN) go run ./examples/dns-cloudflare
