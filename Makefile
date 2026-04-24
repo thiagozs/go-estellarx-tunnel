@@ -15,12 +15,31 @@ NAMECOM_USER  ?=
 NAMECOM_TOKEN ?=
 CF_API_TOKEN  ?=
 
-.PHONY: all build server client clean fmt vet tidy cross-linux \
+.PHONY: all build server client clean fmt vet tidy \
+        build-linux build-mac build-windows build-rpi build-all \
         run-server run-server-tls run-server-namecom run-server-cloudflare run-client \
-        example-namecom example-cloudflare
+        example-namecom example-cloudflare help
 
 all: build
 
+## help: Show this help message
+help:
+	@echo "Usage: make <target>"
+	@echo ""
+	@echo "Build targets:"
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## /  /' | column -t -s ':'
+	@echo ""
+	@echo "Variables (override on CLI):"
+	@echo "  TLS_DOMAIN              Domain for TLS certificate"
+	@echo "  TOKEN                   Shared secret token"
+	@echo "  NAMECOM_USER            name.com username"
+	@echo "  NAMECOM_TOKEN           name.com API token"
+	@echo "  CF_API_TOKEN            Cloudflare API token"
+	@echo "  CERT_CACHE_DIR          Certificate cache directory (default: certs)"
+	@echo "  CERT_TTL                Certificate TTL (default: 168h)"
+	@echo "  CERT_CLEANUP_INTERVAL   Cert cleanup interval (default: 6h)"
+
+## build: Build server and client for the current platform
 build: server client
 
 server:
@@ -29,19 +48,46 @@ server:
 client:
 	go build -o $(BIN_DIR)/tunnel-client ./client
 
-cross-linux:
+## build-linux: Build for Linux amd64
+build-linux:
 	GOOS=linux GOARCH=amd64 go build -o $(BIN_DIR)/tunnel-server-linux-amd64 ./server
 	GOOS=linux GOARCH=amd64 go build -o $(BIN_DIR)/tunnel-client-linux-amd64 ./client
 
+## build-mac: Build for macOS (Intel and Apple Silicon)
+build-mac:
+	GOOS=darwin GOARCH=amd64 go build -o $(BIN_DIR)/tunnel-server-darwin-amd64 ./server
+	GOOS=darwin GOARCH=amd64 go build -o $(BIN_DIR)/tunnel-client-darwin-amd64 ./client
+	GOOS=darwin GOARCH=arm64 go build -o $(BIN_DIR)/tunnel-server-darwin-arm64 ./server
+	GOOS=darwin GOARCH=arm64 go build -o $(BIN_DIR)/tunnel-client-darwin-arm64 ./client
+
+## build-windows: Build for Windows amd64
+build-windows:
+	GOOS=windows GOARCH=amd64 go build -o $(BIN_DIR)/tunnel-server-windows-amd64.exe ./server
+	GOOS=windows GOARCH=amd64 go build -o $(BIN_DIR)/tunnel-client-windows-amd64.exe ./client
+
+## build-rpi: Build for Raspberry Pi (arm64 and arm32/armv7)
+build-rpi:
+	GOOS=linux GOARCH=arm64 go build -o $(BIN_DIR)/tunnel-server-linux-arm64 ./server
+	GOOS=linux GOARCH=arm64 go build -o $(BIN_DIR)/tunnel-client-linux-arm64 ./client
+	GOOS=linux GOARCH=arm GOARM=7 go build -o $(BIN_DIR)/tunnel-server-linux-armv7 ./server
+	GOOS=linux GOARCH=arm GOARM=7 go build -o $(BIN_DIR)/tunnel-client-linux-armv7 ./client
+
+## build-all: Build for all platforms (linux, mac, windows, raspberry pi)
+build-all: build-linux build-mac build-windows build-rpi
+
+## clean: Remove build artifacts
 clean:
 	rm -rf $(BIN_DIR)
 
+## fmt: Format Go source files
 fmt:
 	go fmt ./...
 
+## vet: Run go vet
 vet:
 	go vet ./...
 
+## tidy: Tidy go modules
 tidy:
 	go mod tidy
 

@@ -1,3 +1,5 @@
 .claude
 bin/*
 !bin/.gitkeep
+.rtk/
+CLAUDE.md
