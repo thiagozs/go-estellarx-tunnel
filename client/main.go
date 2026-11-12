@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -62,12 +63,26 @@ func run(serverURL, token, subdomain, localAddr string) {
 	}
 }
 
+// wsConn serializes writes: gorilla/websocket allows only one concurrent
+// writer, and responses are sent from one goroutine per request.
+type wsConn struct {
+	*websocket.Conn
+	mu sync.Mutex
+}
+
+func (c *wsConn) WriteMessage(messageType int, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.WriteMessage(messageType, data)
+}
+
 func connect(serverURL, token, subdomain, localAddr string) error {
 	log.Printf("connecting to %s ...", serverURL)
-	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
+	raw, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	conn := &wsConn{Conn: raw}
 	defer conn.Close()
 
 	// Send register message.
@@ -76,8 +91,8 @@ func connect(serverURL, token, subdomain, localAddr string) error {
 		Token:     token,
 		Subdomain: subdomain,
 	}
-	raw, _ := reg.Encode()
-	if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+	regRaw, _ := reg.Encode()
+	if err := conn.WriteMessage(websocket.TextMessage, regRaw); err != nil {
 		return fmt.Errorf("send register: %w", err)
 	}
 
@@ -117,12 +132,14 @@ func connect(serverURL, token, subdomain, localAddr string) error {
 		case shared.MsgTypePing:
 			pong := &shared.Message{Type: shared.MsgTypePong}
 			b, _ := pong.Encode()
-			conn.WriteMessage(websocket.TextMessage, b)
+			if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+				return fmt.Errorf("send pong: %w", err)
+			}
 		}
 	}
 }
 
-func handleRequest(conn *websocket.Conn, msg *shared.Message, localAddr string) {
+func handleRequest(conn *wsConn, msg *shared.Message, localAddr string) {
 	url := localAddr + msg.HTTPPath
 	method := msg.HTTPMethod
 	if method == "" {
@@ -154,7 +171,7 @@ func handleRequest(conn *websocket.Conn, msg *shared.Message, localAddr string) 
 	sendResponse(conn, msg.RequestID, resp.StatusCode, headers, body)
 }
 
-func sendResponse(conn *websocket.Conn, reqID string, status int, headers map[string]string, body []byte) {
+func sendResponse(conn *wsConn, reqID string, status int, headers map[string]string, body []byte) {
 	msg := &shared.Message{
 		Type:       shared.MsgTypeDataAck,
 		RequestID:  reqID,
@@ -163,7 +180,9 @@ func sendResponse(conn *websocket.Conn, reqID string, status int, headers map[st
 		Data:       body,
 	}
 	raw, _ := msg.Encode()
-	conn.WriteMessage(websocket.TextMessage, raw)
+	if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+		log.Printf("send response %s: %v", reqID, err)
+	}
 }
 
 // backoff returns an exponential delay capped at 30s.
