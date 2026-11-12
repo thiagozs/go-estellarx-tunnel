@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -28,7 +29,29 @@ type tunnel struct {
 	conn      *websocket.Conn
 	mu        sync.Mutex
 	pending   map[string]chan *shared.Message // requestID -> response chan
+	streams   map[string]*stream              // requestID -> proxied WebSocket
+	done      chan struct{}                   // closed when the client disconnects
 }
+
+// send writes one message to the client; writes are serialized by t.mu.
+func (t *tunnel) send(m *shared.Message) error {
+	raw, err := m.Encode()
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn.WriteMessage(websocket.TextMessage, raw)
+}
+
+// stream is one visitor WebSocket proxied through the tunnel.
+type stream struct {
+	ch   chan *shared.Message // ws_open_ack, ws_msg and ws_close from the client
+	kill chan struct{}
+	once sync.Once
+}
+
+func (s *stream) abort() { s.once.Do(func() { close(s.kill) }) }
 
 // registry maps subdomain -> tunnel.
 type registry struct {
@@ -261,9 +284,12 @@ func handleControl(w http.ResponseWriter, r *http.Request,
 		subdomain: sub,
 		conn:      conn,
 		pending:   make(map[string]chan *shared.Message),
+		streams:   make(map[string]*stream),
+		done:      make(chan struct{}),
 	}
 	reg.register(sub, t)
 	defer reg.unregister(sub)
+	defer close(t.done)
 
 	// Send ack.
 	ack := &shared.Message{Type: shared.MsgTypeRegisterAck, Subdomain: sub}
@@ -310,6 +336,20 @@ func handleControl(w http.ResponseWriter, r *http.Request,
 			if ok {
 				ch <- resp
 			}
+		case shared.MsgTypeWSOpenAck, shared.MsgTypeWSMsg, shared.MsgTypeWSClose:
+			t.mu.Lock()
+			st, ok := t.streams[resp.RequestID]
+			t.mu.Unlock()
+			if !ok {
+				continue
+			}
+			select {
+			case st.ch <- resp:
+			default:
+				// The visitor is not keeping up; never block the control loop.
+				log.Printf("tunnel %s: stream %s overflow, closing", sub, resp.RequestID)
+				st.abort()
+			}
 		case shared.MsgTypePong:
 			// keep-alive response, ignore
 		}
@@ -331,16 +371,17 @@ func handleProxy(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	headers := forwardHeaders(r)
+	if websocket.IsWebSocketUpgrade(r) {
+		proxyWebSocket(w, r, t, headers)
+		return
+	}
+
 	// Build a request ID — atomic counter guarantees uniqueness under concurrent load.
 	reqID := fmt.Sprintf("%d", reqCounter.Add(1))
 
 	// Read body.
 	body, _ := io.ReadAll(r.Body)
-
-	headers := make(map[string]string)
-	for k, v := range r.Header {
-		headers[k] = strings.Join(v, ", ")
-	}
 
 	msg := &shared.Message{
 		Type:       shared.MsgTypeData,
@@ -386,6 +427,140 @@ func handleProxy(w http.ResponseWriter, r *http.Request,
 		_, _ = w.Write(resp.Data)
 	case <-time.After(30 * time.Second):
 		http.Error(w, "tunnel timeout", http.StatusGatewayTimeout)
+	}
+}
+
+// forwardHeaders copies the visitor's headers and sets X-Forwarded-For,
+// -Proto and -Host, replacing whatever the visitor sent in them.
+func forwardHeaders(r *http.Request) map[string]string {
+	headers := make(map[string]string, len(r.Header)+3)
+	for k, v := range r.Header {
+		headers[k] = strings.Join(v, ", ")
+	}
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(ip); err == nil {
+		ip = host
+	}
+	proto := "http"
+	if r.TLS != nil {
+		proto = "https"
+	}
+	headers["X-Forwarded-For"] = ip
+	headers["X-Forwarded-Proto"] = proto
+	headers["X-Forwarded-Host"] = r.Host
+	return headers
+}
+
+// proxyWebSocket asks the client to open the same WebSocket on the local
+// service, upgrades the visitor only if that worked, then pumps frames both
+// ways until either side closes.
+func proxyWebSocket(w http.ResponseWriter, r *http.Request, t *tunnel, headers map[string]string) {
+	id := fmt.Sprintf("%d", reqCounter.Add(1))
+	for k := range headers {
+		if shared.WebSocketHopHeaders[http.CanonicalHeaderKey(k)] {
+			delete(headers, k)
+		}
+	}
+
+	st := &stream{ch: make(chan *shared.Message, 1024), kill: make(chan struct{})}
+	t.mu.Lock()
+	t.streams[id] = st
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		delete(t.streams, id)
+		t.mu.Unlock()
+	}()
+
+	open := &shared.Message{Type: shared.MsgTypeWSOpen, RequestID: id, HTTPPath: r.RequestURI, HTTPHeader: headers}
+	if err := t.send(open); err != nil {
+		http.Error(w, "tunnel write failed", http.StatusBadGateway)
+		return
+	}
+
+	var ack *shared.Message
+	select {
+	case ack = <-st.ch:
+	case <-time.After(15 * time.Second):
+		_ = t.send(&shared.Message{Type: shared.MsgTypeWSClose, RequestID: id})
+		http.Error(w, "tunnel timeout", http.StatusGatewayTimeout)
+		return
+	case <-st.kill:
+		http.Error(w, "tunnel stream aborted", http.StatusBadGateway)
+		return
+	case <-t.done:
+		http.Error(w, "tunnel disconnected", http.StatusBadGateway)
+		return
+	}
+	if ack.Type != shared.MsgTypeWSOpenAck || ack.StatusCode != http.StatusSwitchingProtocols {
+		// Local service refused the upgrade: relay its answer (401, 403...).
+		status := ack.StatusCode
+		if status == 0 || status == http.StatusSwitchingProtocols {
+			status = http.StatusBadGateway
+		}
+		for k, v := range ack.HTTPHeader {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(ack.Data)
+		return
+	}
+
+	respHeader := http.Header{}
+	if p := ack.HTTPHeader["Sec-Websocket-Protocol"]; p != "" {
+		respHeader.Set("Sec-WebSocket-Protocol", p)
+	}
+	conn, err := upgrader.Upgrade(w, r, respHeader)
+	if err != nil {
+		_ = t.send(&shared.Message{Type: shared.MsgTypeWSClose, RequestID: id})
+		return
+	}
+	defer conn.Close()
+
+	// Visitor → client.
+	go func() {
+		defer st.abort()
+		for {
+			typ, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if t.send(&shared.Message{Type: shared.MsgTypeWSMsg, RequestID: id, WSType: typ, Data: data}) != nil {
+				return
+			}
+		}
+	}()
+
+	// Client → visitor. This loop is the only writer on conn.
+	closeVisitor := func() {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+	}
+	for {
+		select {
+		case m := <-st.ch:
+			switch m.Type {
+			case shared.MsgTypeWSMsg:
+				typ := m.WSType
+				if typ == 0 {
+					typ = websocket.TextMessage
+				}
+				if err := conn.WriteMessage(typ, m.Data); err != nil {
+					_ = t.send(&shared.Message{Type: shared.MsgTypeWSClose, RequestID: id})
+					return
+				}
+			case shared.MsgTypeWSClose:
+				closeVisitor()
+				return
+			}
+		case <-st.kill:
+			_ = t.send(&shared.Message{Type: shared.MsgTypeWSClose, RequestID: id})
+			closeVisitor()
+			return
+		case <-t.done:
+			closeVisitor()
+			return
+		}
 	}
 }
 
